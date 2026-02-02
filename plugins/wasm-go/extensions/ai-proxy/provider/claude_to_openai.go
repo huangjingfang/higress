@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 )
@@ -256,16 +257,17 @@ func (c *ClaudeToOpenAIConverter) ConvertOpenAIResponseToClaude(ctx wrapper.Http
 				contents = append(contents, claudeTextGenContent{
 					Type:      "thinking",
 					Signature: "", // OpenAI doesn't provide signature, use empty string
-					Thinking:  reasoningText,
+					Thinking:  &reasoningText, // Use pointer
 				})
 				log.Debugf("[OpenAI->Claude] Added thinking content: %s", reasoningText)
 			}
 
 			// Add text content if present
 			if choice.Message.StringContent() != "" {
+				textContent := choice.Message.StringContent()
 				contents = append(contents, claudeTextGenContent{
 					Type: "text",
-					Text: choice.Message.StringContent(),
+					Text: &textContent, // Use pointer
 				})
 			}
 
@@ -515,13 +517,14 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 			c.nextContentIndex++
 			c.thinkingBlockStarted = true
 			log.Debugf("[OpenAI->Claude] Generated content_block_start event for thinking at index %d", c.thinkingBlockIndex)
+			emptyThinking := "" // Create a pointer to empty string to ensure it's serialized
 			responses = append(responses, &claudeTextGenStreamResponse{
 				Type:  "content_block_start",
 				Index: &c.thinkingBlockIndex,
 				ContentBlock: &claudeTextGenContent{
-					Type:      "thinking",
-					Signature: "", // OpenAI doesn't provide signature
-					Thinking:  "",
+					Type:     "thinking",
+					Thinking: &emptyThinking, // Non-nil pointer ensures serialization
+					// Text is nil, so it won't be serialized
 				},
 			})
 		}
@@ -532,8 +535,8 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 			Type:  "content_block_delta",
 			Index: &c.thinkingBlockIndex,
 			Delta: &claudeTextGenDelta{
-				Type: "thinking_delta", // Use thinking_delta for reasoning content
-				Text: reasoningText,
+				Type:     "thinking_delta", // Use thinking_delta for reasoning content
+				Thinking: reasoningText,
 			},
 		})
 	}
@@ -551,6 +554,18 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 		// Close thinking content block if it's still open
 		if c.thinkingBlockStarted && !c.thinkingBlockStopped {
 			c.thinkingBlockStopped = true
+			log.Debugf("[OpenAI->Claude] Sending signature_delta before closing thinking block")
+			// Generate a UUID for signature (since OpenAI doesn't provide one)
+			signature := uuid.New().String()
+			// Send signature_delta event before content_block_stop (required by Anthropic API)
+			responses = append(responses, &claudeTextGenStreamResponse{
+				Type:  "content_block_delta",
+				Index: &c.thinkingBlockIndex,
+				Delta: &claudeTextGenDelta{
+					Type:      "signature_delta",
+					Signature: signature,
+				},
+			})
 			log.Debugf("[OpenAI->Claude] Closing thinking content block before text")
 			responses = append(responses, &claudeTextGenStreamResponse{
 				Type:  "content_block_stop",
@@ -564,12 +579,14 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 			c.nextContentIndex++
 			c.textBlockStarted = true
 			log.Debugf("[OpenAI->Claude] Generated content_block_start event for text at index %d", c.textBlockIndex)
+			emptyText := "" // Create a pointer to empty string to ensure it's serialized
 			responses = append(responses, &claudeTextGenStreamResponse{
 				Type:  "content_block_start",
 				Index: &c.textBlockIndex,
 				ContentBlock: &claudeTextGenContent{
 					Type: "text",
-					Text: "",
+					Text: &emptyText, // Non-nil pointer ensures serialization
+					// Thinking is nil, so it won't be serialized
 				},
 			})
 		}
@@ -656,6 +673,18 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 		// Send content_block_stop for any active content blocks
 		if c.thinkingBlockStarted && !c.thinkingBlockStopped {
 			c.thinkingBlockStopped = true
+			log.Debugf("[OpenAI->Claude] Sending signature_delta before closing thinking block")
+			// Generate a UUID for signature (since OpenAI doesn't provide one)
+			signature := uuid.New().String()
+			// Send signature_delta event before content_block_stop (required by Anthropic API)
+			responses = append(responses, &claudeTextGenStreamResponse{
+				Type:  "content_block_delta",
+				Index: &c.thinkingBlockIndex,
+				Delta: &claudeTextGenDelta{
+					Type:      "signature_delta",
+					Signature: signature,
+				},
+			})
 			log.Debugf("[OpenAI->Claude] Generated thinking content_block_stop event at index %d", c.thinkingBlockIndex)
 			responses = append(responses, &claudeTextGenStreamResponse{
 				Type:  "content_block_stop",
@@ -716,39 +745,31 @@ func (c *ClaudeToOpenAIConverter) buildClaudeStreamResponse(ctx wrapper.HttpCont
 		// Clear active tool index
 		c.activeToolIndex = nil
 
-		// Cache stop_reason until we get usage info (Claude protocol requires them together)
-		c.pendingStopReason = &claudeFinishReason
-		log.Debugf("[OpenAI->Claude] Cached stop_reason: %s, waiting for usage", claudeFinishReason)
-	}
-
-	// Handle usage information
-	if openaiResponse.Usage != nil && choice.FinishReason == nil {
-		log.Debugf("[OpenAI->Claude] Processing usage info - input: %d, output: %d",
-			openaiResponse.Usage.PromptTokens, openaiResponse.Usage.CompletionTokens)
-
-		// Send message_delta with both stop_reason and usage (Claude protocol requirement)
+		// Send message_delta and message_stop when we receive finish_reason
+		// According to Anthropic API spec, message_delta should come after all content blocks
 		messageDelta := &claudeTextGenStreamResponse{
 			Type: "message_delta",
 			Delta: &claudeTextGenDelta{
-				Type: "message_delta",
+				Type:       "message_delta",
+				StopReason: &claudeFinishReason,
 			},
-			Usage: &claudeTextGenUsage{
+		}
+
+		// Include usage if available in this chunk
+		if openaiResponse.Usage != nil {
+			messageDelta.Usage = &claudeTextGenUsage{
 				InputTokens:  openaiResponse.Usage.PromptTokens,
 				OutputTokens: openaiResponse.Usage.CompletionTokens,
-			},
+			}
+			log.Debugf("[OpenAI->Claude] Sending message_delta with stop_reason=%s and usage (input=%d, output=%d)",
+				claudeFinishReason, openaiResponse.Usage.PromptTokens, openaiResponse.Usage.CompletionTokens)
+		} else {
+			log.Debugf("[OpenAI->Claude] Sending message_delta with stop_reason=%s (no usage yet)", claudeFinishReason)
 		}
 
-		// Include cached stop_reason if available
-		if c.pendingStopReason != nil {
-			log.Debugf("[OpenAI->Claude] Combining cached stop_reason %s with usage", *c.pendingStopReason)
-			messageDelta.Delta.StopReason = c.pendingStopReason
-			c.pendingStopReason = nil // Clear cache
-		}
-
-		log.Debugf("[OpenAI->Claude] Generated message_delta event with usage and stop_reason")
 		responses = append(responses, messageDelta)
 
-		// Send message_stop after combined message_delta
+		// Send message_stop immediately after message_delta
 		if !c.messageStopSent {
 			c.messageStopSent = true
 			log.Debugf("[OpenAI->Claude] Generated message_stop event")
