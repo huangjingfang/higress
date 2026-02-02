@@ -233,12 +233,12 @@ type claudeTextGenResponse struct {
 
 type claudeTextGenContent struct {
 	Type      string                 `json:"type,omitempty"`
-	Text      string                 `json:"text,omitempty"`
+	Text      *string                `json:"text,omitempty"`      // Use pointer for conditional serialization
 	Id        string                 `json:"id,omitempty"`        // For tool_use
 	Name      string                 `json:"name,omitempty"`      // For tool_use
 	Input     map[string]interface{} `json:"input,omitempty"`     // For tool_use
 	Signature string                 `json:"signature,omitempty"` // For thinking
-	Thinking  string                 `json:"thinking,omitempty"`  // For thinking
+	Thinking  *string                `json:"thinking,omitempty"`  // Use pointer for conditional serialization
 }
 
 type claudeTextGenUsage struct {
@@ -266,6 +266,8 @@ type claudeTextGenStreamResponse struct {
 type claudeTextGenDelta struct {
 	Type         string  `json:"type"`
 	Text         string  `json:"text,omitempty"`
+	Thinking     string  `json:"thinking,omitempty"`  // For thinking_delta
+	Signature    string  `json:"signature,omitempty"` // For signature_delta
 	PartialJson  string  `json:"partial_json,omitempty"`
 	StopReason   *string `json:"stop_reason,omitempty"`
 	StopSequence *string `json:"stop_sequence,omitempty"`
